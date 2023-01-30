@@ -1,0 +1,1353 @@
+---
+title:    "ISE 5103 Intelligent Data Analytics"
+subtitle: "Homework 7 - Modeling Competition"
+author:   "Daniel Carpenter, Sonaxy Mohanty, & Zachary Knepp"
+date:     "November 2022"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    highlight: arrow
+    latex_engine: xelatex
+  # github_document:
+  #   toc: yes
+  #   toc_depth: 2
+urlcolor: blue
+cache: true
+fig.width: 7
+fig.height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+
+```{r error=FALSE, message=FALSE, warning=FALSE, echo=FALSE}
+# Packages --------
+
+# Data Wrangling
+library(tidyverse)
+library(skimr)
+library(lubridate) # dates
+
+# Imputation
+library(VIM)   # Factor: kNN
+library(mice)  # Numeric: predictive mean matching
+
+# Modeling
+library(MASS)
+library(caret) # Modeling variants like SVM
+library(earth) # Modeling with Mars
+library(adabag) # Modelling with AdaBoost
+library(glmnet) # Modeling with LASSO
+library(xgboost) #Modelling with Gradient boost
+
+# Aesthetics
+library(knitr)
+library(cowplot)  # multiple ggplots on one plot with plot_grid()
+library(scales)
+library(kableExtra)
+library(ggplot2)
+library(inspectdf)
+
+#Hold-out Validation
+library(caTools)
+
+#Data Correlation
+library(GGally)
+library(regclass)
+
+#RMSE Calculation
+library(MLmetrics)
+
+#p-value for OLS model
+library(broom)
+
+#ncvTest
+library(car)
+
+# variable importance
+library(vip)
+#Partial
+library(pdp)
+```
+
+# General Data Prep
+> For general data preparation, please see conceptual steps below. See `.rmd` file for detailed code.
+
+## Read Training and Test Data
+* Read training and test data  
+* Clean data to ensure each read variable has the correct data type (factor, numeric, Date, etc.)  
+
+```{r, cache=TRUE, echo=FALSE, results='hide'}
+# Read in Data -----------------------------------------------------------------
+
+# Function to read from Git and convert variable types
+readData <- function(csvName) {
+  
+  ## Read the data
+  df <- read.csv(csvName, stringsAsFactors = TRUE) # Training data
+  
+  # Ensure Type Conversion -----------------------------------------------------
+  
+  ## Convert all character data to factor
+  df.goodTypes <- df %>% 
+    
+    ### Ensure boolean variables are numeric
+    mutate_at(vars(
+      admission_type,
+      discharge_disposition,
+      admission_source,
+      time_in_hospital,
+      indicator_level,
+      num_lab_procedures,
+      num_procedures,
+      num_medications,
+      number_outpatient,
+      number_emergency,
+      number_inpatient,
+      number_diagnoses
+      ), as.numeric) %>%
+  
+    ### Ensure factor are factors
+    mutate_at(vars(
+      patientID,
+      race,
+      gender,
+      age,
+      payer_code,
+      medical_specialty,
+      diagnosis,
+      max_glu_serum,
+      A1Cresult,
+      metformin,
+      repaglinide,
+      nateglinide,
+      chlorpropamide,
+      glimepiride,
+      acetohexamide,
+      glipizide,
+      glyburide,
+      tolbutamide,
+      pioglitazone,
+      rosiglitazone,
+      acarbose,
+      miglitol,
+      troglitazone,
+      tolazamide,
+      examide,
+      citoglipton,
+      insulin,
+      glyburide.metformin,
+      glipizide.metformin,
+      glimepiride.pioglitazone,
+      metformin.rosiglitazone,
+      metformin.pioglitazone,
+      diabetesMed
+    ), as.factor) 
+    
+  
+  # Return csv with type conversion
+  return(df.goodTypes)
+} 
+
+setwd("C:/Users/Zach/Desktop/5103-ida-hm7-2022")
+## Training data
+df.train.base <- readData(csvName = 'hm7-Train-r1.csv')
+
+### If training data then ensure target variable is good.
+df.train.base <- df.train.base %>%
+      mutate(readmitted = as.factor(readmitted) )
+
+
+## Test data
+df.test.base  <- readData(csvName = 'hm7-Test-r1.csv')
+
+# Test to see if type conversion worked
+# lapply(df.train.base, class)
+# lapply(df.test.base, class)
+```
+
+
+## Create `numeric` and `factor` *base* `data frames` of both the training and test sets
+```{r, echo=FALSE, results='hide'}
+# Function to separate into factor and numeric data ----------------------------
+separateFactorAndNumeric <- function(df, functionType) {
+  
+  # Numeric Data frame
+  df.typeSubset<- df %>%
+  
+    # selecting all the ______ data, e.g. is.numeric
+    dplyr::select_if(functionType) %>%
+  
+    # converting the data frame to tibble
+    as_tibble()
+  
+  return(df.typeSubset)
+}
+
+
+# Create the factor and numeric data -------------------------------------------
+
+## Training data
+df.train.base.numeric <- separateFactorAndNumeric(df.train.base, is.numeric) # numeric
+df.train.base.factor  <- separateFactorAndNumeric(df.train.base, is.factor)  # factor
+
+## Test Data
+df.test.base.numeric  <- separateFactorAndNumeric(df.test.base, is.numeric) # numeric
+df.test.base.factor   <- separateFactorAndNumeric(df.test.base, is.factor)  # factor
+```
+
+\newpage
+
+# Data Understanding
+> Create a data quality report of `numeric` and `factor` data  
+> Created function called `dataQualityReport()` to create factor and numeric QA report
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Function for data report
+dataQualityReport <- function(df) {
+  
+  # Function to remove any columns with NA
+  removeColsWithNA <- function(df) {
+    return( df[ , colSums(is.na(df)) == 0] )
+  }
+  
+  # Create Comprehensive data report using skimr package
+  # This is done a bit piece-wise because PDF latex does not like the skimr package
+  # Very much. So Instead of printing `skim(df)`, I have to pull the contents manually
+  # Unfortunately. This is not an issue with html typically.
+  dataReport <- skim(df) %>%
+    rename_all(~str_replace(.,"skim_","")) %>%
+    arrange(type, desc(complete_rate) ) # sort data 
+  
+  # Filter to the class types
+  dataReport.numeric <- dataReport %>% filter(type == 'numeric') # numeric data
+  dataReport.factor  <- dataReport %>% filter(type == 'factor' ) # factor  data
+  
+  # Remove columns that do not apply to this type of data -----------------------
+  
+  ## numeric data
+  dataReport.numeric <- removeColsWithNA(dataReport.numeric)  %>%
+    
+    # Clean column names by removing numeric prefix, 
+    rename_all(~str_replace(.,"numeric.","")) 
+    
+  ## factor  data
+  dataReport.factor  <- removeColsWithNA(dataReport.factor ) %>%
+  
+    # Clean column names by removing factor  prefix
+    rename_all(~str_replace(.,"factor.",""))  
+  
+  
+  # Set up options for Display the reports
+  options(skimr_strip_metadata = FALSE)
+  options(digits=2)
+  options(scipen=99)
+  
+  # Numeric report <- Get summary of data frame --------------------------------
+  
+    # data frame stats
+    dfStats.num <- data.frame(Num_Numeric_Variables = ncol(df %>% select_if(is.numeric)),
+                              Total_Observations    = nrow(df) )
+    
+    # Now see individual column statistics
+    dfColStats.num <- dataReport.numeric %>% 
+      dplyr::select(-type, -hist)
+    
+  
+  # Factor report <- Get summary of data frame --------------------------------
+  
+    # Get summary of data frame
+    dfStats.factor <- data.frame(Num_Factor_Variables = ncol(df %>% select_if(is.factor)),
+                                 Total_Observations   = nrow(df) )
+    
+    # Now see individual column statistics
+    dfColStats.factor <- dataReport.factor  %>% 
+      dplyr::select(-type, -ordered) 
+    
+    
+  # Return the data frames
+  return(list('dfStats.num'       = dfStats.num,    
+              'dfColStats.num'    = dfColStats.num,
+              'dfStats.factor'    = dfStats.factor, 
+              'dfColStats.factor' = dfColStats.factor))
+}
+```
+
+
+## Numeric Data Quality Report
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Get the factor and numeric reports
+initialReport <- dataQualityReport(df.train.base)
+
+# Numeric data frame stats
+initialReport$dfStats.num %>% kable()
+
+# Numeric column stats
+initialReport$dfColStats.num %>%
+  kable() %>% kable_styling(font_size=7, latex_options = 'HOLD_position') # numeric data
+
+```
+
+
+## Factor Data Quality Report
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# factor data frame stats
+initialReport$dfStats.factor %>% kable()
+
+# factor column stats
+initialReport$dfColStats.factor %>%
+  kable() %>% kable_styling(font_size=7, latex_options = 'HOLD_position') # numeric data
+```
+
+\newpage
+  
+# Data Cleansing
+
+## Missingingness
+* To handle missingness, we will likely take the following approach for `numeric` and `factor` data:  
+  - `Numeric`: Impute missing values using predictive mean matching with the `mice` package  
+  - `Factor`: Leverage k-nearest neighbors to impute missing factor data. 
+  This is likely possible because there is not a significant portion of the factor 
+  data that is missing, so it should not be computationally extensive.  
+  
+```{r, echo=FALSE, results='hide'}
+# ==============================================================================
+# NOTE THAT ALL WILL CLEANSING DONE IN THIS CODE CHUNK TO MAKE IT EASIER
+# END GOAL IS TO CREATE A FUNCTION SO WE CAN EASILY APPLY TO TEST DATA
+# TO REMOVE DUPLICATION
+#
+# Goal is to clean up:
+#   - Missingness
+#   - Factors
+# ==============================================================================
+
+# Copy data
+df <- df.train.base # Full dataset
+
+df.numeric <- df.train.base.numeric # Numeric only columns
+df.factor  <- df.train.base.factor  # Numeric only columns
+df.imputed <- df                    # To store numeric imputation output
+
+# Missingingness ---------------------------------------------------------------
+
+### `Numeric`: Impute missing values using predictive mean matching with the `mice` package
+
+# Note `see Imputation()` function to visualize the imputation
+seeImputation <- function(df, df.meanInputed, 
+                          imputationMethod) {
+  
+  # Min/Max ranges so actual and imputed histograms align
+  yMin = quantile(df.meanInputed$y, 0.05)
+  yMax = max(df.meanInputed$y)
+  
+  # Non Altered data -------------------------------------------------
+  
+  meanVal = mean(df$y, na.rm=T) # mean of the non altered data
+  
+  # Create the plot
+  p1 <- df %>%
+    ggplot(aes(x = y)) +
+    
+    # Histogram
+    geom_histogram(color = 'grey65', fill = 'grey95') +
+    
+    # The mean value line
+    geom_vline(xintercept = meanVal, color = 'tomato3') +
+    
+    # Text associated with mean value
+    annotate("text", 
+             label = "Mean Value", 
+             x = meanVal, y = 100, 
+             size = 5, colour = "tomato3" ) +
+    
+    # Labels
+    labs(title = 'Data with Missing Values',
+         y     = 'Frequency', 
+         x     = '' ) +
+    
+    xlim(yMin, yMax) + # min and max range of x axis (for equal comparison)
+    theme_minimal() # Theme
+  
+  
+  # Imputed data -------------------------------------------------
+  meanValImpute = mean(df.meanInputed$y, na.rm=T)
+  
+  # Create the plot
+  p2 <- df.meanInputed %>%
+    ggplot(aes(x = y)) +
+    
+    # Histogram
+    geom_histogram(color = 'grey65', fill = 'grey95') +
+    
+    # The mean value line
+    geom_vline(xintercept = meanVal, color = 'tomato3') +
+    
+    # Text associated with mean value
+    annotate("text", 
+             label = "Mean Value", 
+             x = meanValImpute, y = 100, 
+             size = 5, colour = "tomato3" ) +
+    
+    # Labels
+    labs(title = 'Data without Missing Values',
+             subtitle = 'Using PMM',
+             y = 'Frequency', 
+             x = imputationMethod) +
+    
+    xlim(yMin, yMax) + # min and max range of x axis (for equal comparison)
+    theme_minimal() # Theme
+  
+  # Variation scatter ----------------------------------------------------------
+  
+  p3 <- df.meanInputed %>% ggplot(aes(x=rexp(length(y)), y=y, color=is.na(df$y))) + 
+    
+    # Add points
+    geom_point(alpha = 0.5) +
+    
+    # Colors, limits, labels, and themes
+    scale_color_manual(values = c('grey80', 'tomato3'),
+                       labels = c('Actuals', 'Imputed') ) +
+    ylim(0, quantile(df.meanInputed$y, 0.99)) + # lower 99% of dist
+    labs(title   = 'Variation of Actuals vs. Imputed Data',
+         x       = 'x', 
+         y       = imputationMethod,
+         caption =paste0('\nUsing training.csv data',
+                         '\nOnly showing lower 99% of distribution for viewing') 
+         ) +
+    theme_minimal() + theme(legend.position = 'bottom',
+                            legend.title    = element_blank())
+  
+  
+  # Combine the plots for the final returned output
+  combinedPlots <- plot_grid(p1, p2, p3, 
+                             ncol = 1, label_size = 12,
+                             rel_heights = c(1, 1.1, 1.75))
+  return(combinedPlots)
+}
+
+# Create function to impute via `PMM`
+imputeWithPMM <- function(colWithMissingData) {
+  
+  # Using the mice package
+  suppressMessages(library(mice))
+  
+  # Discover the missing rows
+  isMissing <- is.na(colWithMissingData) 
+  
+  # Create data frame to pass to PMM imputation function from mic package
+  df <- data.frame(x       = rexp(length(colWithMissingData)), # meaningless x to help show variation 
+                   y       = colWithMissingData, 
+                   missing = isMissing)
+  
+  # imputation by PMM
+  df[isMissing, "y"] <- mice.impute.pmm( df$y, 
+                                        !df$missing, 
+                                         df$x)
+  
+  return(df$y)
+}
+
+
+# Which columns has Na's?
+colNamesWithNulls.num <- colnames(df.numeric[ , colSums(is.na(df.numeric)) != 0])
+colNamesWithNulls.num
+
+numberOfColsWithNulls = length(colNamesWithNulls.num)
+
+# For each of the numeric columns with null values
+for (colWithNullsNum in 1:numberOfColsWithNulls) {
+  
+  # The name of the column with null values
+  nameOfThisColumn <- colNamesWithNulls.num[colWithNullsNum]
+  
+  # Get the actual data of the column with nulls
+  colWithNulls <- df[, nameOfThisColumn]
+  
+  # Impute the missing values with PMM
+  imputedValues.num <- imputeWithPMM(colWithNulls)
+  
+  # Now store the data in the imputed data frame
+  df.imputed[, nameOfThisColumn] <- imputedValues.num
+  
+  # Save a visualization of the imputation
+  pmmVisual <- seeImputation(data.frame(y = colWithNulls),
+                             data.frame(y = imputedValues.num),
+                             nameOfThisColumn )
+  
+  # Uncomment if you want to visual the PMM imputation
+  # fileToSave = paste0('OutputPMM/Imputation_With_PMM_', nameOfThisColumn, '.pdf')
+  # print(paste0('For imputation results of ', nameOfThisColumn, ', see ', fileToSave))
+  # dir.create("OutputPMM/")
+  # ggsave(pmmVisual, filename = fileToSave,
+  #        height = 11, width = 8.5)
+}
+
+#colnames(df.imputed[ , colSums(is.na(df.imputed)) != 0]) # Check to see if it worked for numeric fields
+
+
+### `Factor`: Leverage k-nearest neighbors to impute missing factor data. ------
+
+# Get the factor data with missing columns
+colNamesWithNulls.factor <- colnames(df.factor[ , colSums(is.na(df.factor)) != 0])
+colNamesWithNulls.factor
+
+NUM_NEIGHBORS = 5 # number of neighbors
+
+# Impute missing factor data for columns with missing data
+imputedValues.factor <- kNN( df[, colNamesWithNulls.factor], k=NUM_NEIGHBORS )
+
+# Remove the columns indicating if factor data was imputed
+imputedValues.factor <- imputedValues.factor %>% dplyr::select(-ends_with('imp'))
+
+# Now store the data in the imputed data frame
+df.imputed[, colNamesWithNulls.factor] <- imputedValues.factor
+
+#colnames(df.imputed[ , colSums(is.na(df.imputed)) != 0]) # Check to see if it worked
+
+```  
+  
+  
+* We are going to factor collapse factor columns with more than 4 columns  
+* So there will be 5 of the original, and 1 containing 'other'  
+
+```{r, echo=FALSE}
+# We are going to factor collapse factor columns with more than 4 columns
+# So there will be 5 of the original, and 1 containing 'other'
+# This is the threshold
+FACTOR_THRESHOLD = 4
+
+df.train.clean <- df.imputed
+
+# Make data set of `factor` variables called `df.train.base.factor`
+df.train.factor <- df.imputed %>%
+
+  # selecting all the numeric data
+  dplyr::select_if(is.factor) %>%
+
+  # converting the data frame to tibble
+  as_tibble()
+
+# Get list of factors and the number of unique values
+factorCols <-
+  as.data.frame(t(df.train.factor %>% summarise_all(n_distinct))) #%>%
+  # kable()
+
+# Get a list of the factors we are going to collapse
+colsWithManyFactors <- rownames(factorCols %>% filter(V1 > FACTOR_THRESHOLD))
+
+# Show a summary of how many factors will be collapsed
+numberOfColsWithManyFactors = length(colsWithManyFactors)
+paste('Before cleaning, there are', numberOfColsWithManyFactors, 'factor columns with more than',
+      FACTOR_THRESHOLD, 'unique values')
+
+# Collapse the affected factors in the original data (the one that already has imputation)
+## for each factor column that we are about to collapse
+# The third column is omits the cutstomer ID and session ID
+FIRST_NON_CUST_SESSION_IDX = 3
+for (collapsedColNum in FIRST_NON_CUST_SESSION_IDX:numberOfColsWithManyFactors) {
+
+  # The name of the column with null values
+  nameOfThisColumn <- colsWithManyFactors[collapsedColNum]
+
+  # Get the actual data of the column with nulls
+  colWithManyFactors <- df.imputed[, nameOfThisColumn]
+
+  # lumps all levels except for the n most frequent
+  df.train.clean[, nameOfThisColumn] <- fct_lump_n(colWithManyFactors,
+                                                   n=FACTOR_THRESHOLD)
+}
+# Check to see if the factor lumping worked
+factorColsCleaned <-
+  t(df.train.clean %>%
+                       select_if(is.factor) %>%
+                       summarise_all(n_distinct))
+paste('After cleaning, there are', sum(factorColsCleaned > FACTOR_THRESHOLD + 1, na.rm = TRUE),
+      "columns with more than", FACTOR_THRESHOLD + 1, "unique values (omitting NA's)")
+
+#counting unique values for each variable
+sapply(lapply(df.train.clean, unique), length) %>%
+  kable()
+
+# Create a cleaned dataset for modeling
+# Does not include any identifiers
+df.train.clean <- df.train.clean %>%
+  dplyr::select(-c(examide,citoglipton,glimepiride.pioglitazone,patientID))
+```  
+  
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Removing all other unnecessary values
+rm(df.imputed, df, df.factor, df.numeric,colNamesWithNulls.factor,
+     colNamesWithNulls.num, colWithNulls, colWithNullsNum, imputedValues.factor,
+     imputedValues.num, nameOfThisColumn, numberOfColsWithNulls, collapsedColNum,
+   colWithManyFactors, colsWithManyFactors, df.imputed,
+   df.train.base, df.train.base.factor, df.train.base.numeric, df.train.factor,
+   FACTOR_THRESHOLD, factorCols, factorColsCleaned, FIRST_NON_CUST_SESSION_IDX,
+   NUM_NEIGHBORS, numberOfColsWithManyFactors)
+
+```
+  
+\newpage  
+
+# Modeling  
+  
+## Building models  
+*   The below classifiers will be tested to classify the data:  
+  1. Logistic Regression  
+  2. LDA
+  3. Classification and Regression Trees  
+  4. Elastic Net 
+  5. MARS
+  6. Random Forest  
+  7. Boosted Trees - boosting, boosting.cv, gradient boosting
+    
+  
+### Logistic Regression  
+* This method was solely used to derive significant features for our model
+  
+```{r,echo=FALSE, warning=FALSE, error=FALSE, message=FALSE, cache=TRUE}
+
+options("digits" = 6)
+#resampling method
+ctrl <- trainControl(method  = "cv", 
+                     number  = 10)
+metric <- 'Accuracy'
+
+
+#fit the model
+# fit.logreg <- glm(readmitted~., 
+#                  data=df.train.clean, 
+#                  family=binomial) 
+
+# step <- stepAIC(fit.logreg, direction="both", k=log(nrow(fit.logreg$data))) 
+# summary(step)
+
+
+fit.logreg1 <- glm(readmitted ~ age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+                   family = binomial, 
+                   data = df.train.clean)
+
+```  
+  
+  
+## LDA  
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+# Fit the model 
+
+#pre-processing for LDA
+preproc.param1 <- df.train.clean %>% preProcess(method = c("center", "scale")) 
+transformed1 <- preproc.param1 %>% predict(df.train.clean)
+
+fit.lda2 <- train(readmitted ~ age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+      data = transformed1, 
+      method="lda", 
+      metric=metric, 
+     # preProc    = c("center","scale"),
+      trControl=ctrl, 
+      ) #0.6167489 0.2162356
+
+
+# Key diagnostics
+keyDiagnostics.lda <- data.frame(Model    = 'LDA',
+                                 Method    = 'lda',
+                                 Package = 'stats',
+                                 Hyperparameters = 'NA',
+                                 Selection = 'NA',
+                                 Accuracy = fit.lda2$results[,'Accuracy'],
+                                 Kappa = fit.lda2$results[,'Kappa'])
+
+
+# Show output
+keyDiagnostics.lda %>% 
+  knitr::kable()
+
+
+
+```
+  
+## CART
+```{r, echo=FALSE, warning=FALSE, error=FALSE, message=FALSE, cache=TRUE}
+#using data without any pre-processing
+# fit.cart1 <- train(readmitted ~ age + admission_source + time_in_hospital +
+#                      payer_code + num_lab_procedures + num_procedures + number_outpatient +
+#                      number_emergency + number_inpatient + diagnosis + number_diagnoses +
+#                      insulin + diabetesMed,
+#                   data=df.train.clean,
+#                   method="rpart",
+#                   metric=metric,
+#                   tuneLength = 9,                   # 9 values of the cost function
+#                   #preProc    = c("center","scale"),
+#                   trControl=ctrl) #0.6255983  0.2410927
+
+# found that hyperparameter cp with 0.0007 has the best value
+#using the cp value and minsplit got more accuracy for the below model
+
+fit.cartf<- rpart(data=df.train.clean,
+            readmitted ~ age + admission_source + time_in_hospital +
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed,
+            control=rpart.control(minsplit=10,cp=0.00073)) 
+
+# pred.cart = predict(fit.cartf, type="prob")
+# confusionMatrix(pred, df.train.clean$readmitted) #0.6283
+
+# Key diagnostics
+keyDiagnostics.cart <- data.frame(Model    = 'CART',
+                                 Method    = 'rpart',
+                                 Package = 'rpart',
+                                 Hyperparameters = 'cp',
+                                 Selection = 0.0007,
+                                 Accuracy = 0.6283,
+                                 Kappa = 0.2462)
+
+
+# Show output
+keyDiagnostics.cart %>% 
+  knitr::kable()
+
+rm(acc, f1, p)
+```  
+  
+## Elastic Net
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+fit.elasticnet <- train(data = df.train.clean, 
+                        readmitted~.,
+                        method     = "glmnet",            # Elastic net
+                        tuneLength = 10,                  # 10 values of alpha and lambdas
+                        metric=metric,
+                        trControl  = ctrl) #0.6202403 0.22276121
+
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+result.elasticnet <- get_best_result(fit.elasticnet)
+
+hyperparameters.elasticnet = list('Alpha'  = result.elasticnet$alpha,
+                                  'Lambda' = result.elasticnet$lambda)
+
+
+keyDiagnostics.elasticnet <- data.frame(Model    = 'Elastic Net',
+                                        Method    = 'glmnet',
+                                        Package = 'caret',
+                                        Hyperparameters = 'Alpha, Lambda',
+                                        Selection = paste('Alpha =',
+                                                                hyperparameters.elasticnet$Alpha, ',',
+                                                                'Lambda =',
+                                                                hyperparameters.elasticnet$Lambda),
+                                        Accuracy     = result.elasticnet$Accuracy,
+                                        Kappa = result.elasticnet$Kappa
+                                        )
+
+# Show output
+keyDiagnostics.elasticnet %>% knitr::kable()
+
+```  
+  
+## MARS  
+  
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+fit.mars <- train(data = df.train.clean, 
+                 readmitted~.,
+                  method     = "earth",             # Earth is for MARS models
+                  tuneLength = 9,                   # 9 values of the cost function
+                  preProc    = c("center","scale"), # Center and scale data
+                  trControl  = ctrl 
+                 ) #0.6257369 0.2375251
+
+
+#hyperparameters
+hyperparameters.mars = list('degree' = fit.mars[["bestTune"]][["degree"]],
+                            'nprune' = fit.mars[["bestTune"]][["nprune"]])
+# Key diagnostics
+keyDiagnostics.mars <- data.frame(Model    = 'MARS',
+                                 Method    = 'earth',
+                                 Package = 'caret',
+                                 Hyperparameters = 'nprune, degree',
+                                 Selection = paste('Degree =', hyperparameters.mars$degree, ',',
+                                                          'nprune =', hyperparameters.mars$nprune),
+                                 Accuracy = fit.mars$results[9,'Accuracy'],
+                                 Kappa = fit.mars$results[9,'Kappa'])
+
+
+# Show output
+keyDiagnostics.mars %>% 
+  knitr::kable()
+
+```  
+  
+## Performance measures of the MARS model
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+pred = predict(fit.mars, df.train.clean, type='raw') #type='class' if the model doesn't take raw
+accuracy <- Accuracy(pred, df.train.clean$readmitted)
+f1 <- F1_Score(pred, df.train.clean$readmitted)
+precision <- Precision(pred, df.train.clean$readmitted)
+
+cat("Accuracy: ", accuracy)
+cat("\nF1 score: ", f1)
+cat("\nPrecision: ", precision)
+
+```  
+  
+  
+  
+
+
+
+## Insight 1 of the MARS model - Best Variables
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+# variable importance plots
+p1 <- vip(fit.mars, num_features = 40, bar = FALSE, value = "gcv") + ggtitle("GCV")
+p2 <- vip(fit.mars, num_features = 40, bar = FALSE, value = "rss") + ggtitle("RSS")
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```  
+## According to the MARS model, the best 3 predictor variables are number_inpatient, number_diagnosis, and number_emergency.
+## The importance of the predictors is measured in GCV (Generalized Cross-Validation), and RSS (Residual Sum of Squares)
+
+
+
+## Insight 2 of the MARS model - Summary and Accuracy
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+summary(fit.mars)
+ggplot(fit.mars)
+
+```  
+## The summary of the MARS model shows the coefficients of the variables, and the plot shows the accuracy of the model as the number of predictors are increased. According to the summary table, the model picked 14 variables best represent the data.
+
+
+
+## Insight 3 of the MARS model - Partial Plots
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+p1 <- partial(fit.mars, pred.var = "number_inpatient", grid.resolution = 10) %>% autoplot()
+p2 <- partial(fit.mars, pred.var = "number_diagnoses", grid.resolution = 10) %>% autoplot()
+p3 <- partial(fit.mars, pred.var = c("number_inpatient", "number_diagnoses"), grid.resolution = 10) %>% 
+  plotPartial(levelplot = FALSE, zlab = "yhat", drape = TRUE, colorkey = TRUE, screen = list(z = -20, x = -60))
+
+gridExtra::grid.arrange(p1, p2, p3, ncol = 3)
+
+```  
+  
+## Partial Plots of the variables number_inpatient and number_diagnoses show the bends/spline that the mars model computes for the best fit. For example, 0-2 in the number_impatient graph represents 1 rate, while 2+ represents a different rate. The graph to the far right shows the plane (number_impatient, number_diagnoses, yhat)
+  
+## Random Forest  
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=TRUE}
+
+control <- trainControl(method = "cv",
+    number = 10,
+    search = "grid")
+
+fit.rf <- train(readmitted ~ age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+                data=df.train.clean, 
+                method="rf", 
+                #tuneLength = 6,                   # 9 values of the cost function
+                #preProc    = c("center","scale"),
+                metric=metric, 
+                trControl=control,
+                allowParallel = TRUE) #0.6266357
+
+#key diagnostics
+keyDiagnostics.rf <- data.frame(Model    = 'Random Forest',
+                                 Method    = 'rf',
+                                 Package = 'caret',
+                                 Hyperparameters = 'mtry',
+                                 Selection = fit.rf$bestTune[,'mtry'],
+                                 Accuracy = fit.rf$results[1,'Accuracy'],
+                                 Kappa = fit.mars$results[1,'Kappa'])
+
+
+# Show output
+keyDiagnostics.rf %>% 
+  knitr::kable()
+
+```  
+
+
+
+## BOOSTING
+```{r, echo=FALSE, error=FALSE, warning=FALSE, message=FALSE, cache=TRUE}
+
+fit.boost<-boosting(readmitted~ age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+                    data = df.train.clean, boos = F, mfinal = 150) # 10 --> 0.6241 
+#50 --> 0.6253
+
+
+#pred = predict(fit.boost, df.train.clean, type='raw')
+# pred.btrain = predict(fit.boost, df.train.clean, type='prob')
+# pred.btrain$error
+#print(1-pred.btrain$error)
+#accuracy and kappa calculation from conf matrix
+#confusionMatrix(table(df.train.clean$readmitted, fit.boost$class))
+
+# Key diagnostics
+keyDiagnostics.boost <- data.frame(Model    = 'Boosting',
+                                 Method    = 'boosting',
+                                 Package = 'adabag',
+                                 Hyperparameters = 'mfinal',
+                                 Selection = 150,
+                                 Accuracy = 0.6253,
+                                 Kappa = 0.239)
+# Show output
+keyDiagnostics.boost %>% 
+  knitr::kable()
+
+# boosting.cv
+fit.cvmodel = boosting.cv(readmitted~age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+                     data=df.train.clean, 
+                     boos=FALSE, 
+                     mfinal=50, 
+                     v=5) #10 --> 0.6228848, BOOS-=TRUE #50 -->0.6254429, BOOS=FALSE
+
+
+# print(1-fit.cvmodel[-1]$error)
+# fit.cvmodel$error
+# confusionMatrix(table(df.train.clean$readmitted, fit.cvmodel$class))
+
+# Key diagnostics
+keyDiagnostics.cvboost <- data.frame(Model    = 'Boosting.CV',
+                                 Method    = 'boosting.cv',
+                                 Package = 'adabag',
+                                 Hyperparameters = 'mfinal',
+                                 Selection = 50,
+                                 Accuracy = 0.6255,
+                                 Kappa = 0.2389)
+
+
+
+
+keyDiagnostics.cvboost %>%
+  knitr::kable()
+
+## gradient boosting
+fit.grboost <- train(readmitted~age + admission_source + time_in_hospital + 
+                     payer_code + num_lab_procedures + num_procedures + number_outpatient +
+                     number_emergency + number_inpatient + diagnosis + number_diagnoses +
+                     insulin + diabetesMed, 
+                     data=df.train.clean, 
+                     method = "xgbTree",
+                     trControl = ctrl
+  ) #0.6331347  
+
+
+#hyperparameters
+hyperparameters.grboost = list('max_depth' = fit.grboost[["bestTune"]][["max_depth"]],
+                            'eta' = fit.grboost[["bestTune"]][["eta"]],
+                            'nrounds' = fit.grboost[["bestTune"]][["nrounds"]])
+# Key diagnostics
+keyDiagnostics.grboost <- data.frame(Model    = 'Gradient boost',
+                                 Method    = 'xgbTree',
+                                 Package = 'xgboost',
+                                 Hyperparameters = 'max_depth, eta, nrounds',
+                                 Selection = paste('max_depth =', hyperparameters.grboost$max_depth, ',',
+                                                          'eta =', hyperparameters.grboost$eta, ',',
+                                                   'nrounds=', hyperparameters.grboost$nrounds),
+                                 Accuracy = 0.6331347,
+                                 Kappa = 0.2563347)
+
+
+# Show output
+keyDiagnostics.grboost %>% 
+  knitr::kable()
+
+```  
+  
+\newpage  
+  
+# SUMMARY TABLE
+  
+```{r, echo=FALSE}
+# Add the key diagnostics here
+rbind(
+  #keyDiagnostics.logreg,
+  keyDiagnostics.lda,
+  keyDiagnostics.cart,
+  keyDiagnostics.elasticnet,
+  keyDiagnostics.mars,
+  keyDiagnostics.rf,
+  keyDiagnostics.boost,
+  keyDiagnostics.cvboost,
+  keyDiagnostics.grboost
+) %>%
+  
+  # Round to 4 digits across numeric data
+  mutate_if(is.numeric, round, digits = 4) %>%
+  
+  # Spit out kable table
+  kable()
+
+```  
+  
+\newpage
+
+# Apply to Test Data  
+
+* Need to clean test data like we did in the train  
+
+* Note all comments for the main model apply here  
+
+* Then apply the models to this dataset
+
+* Outputs a CSV with predicted customer log revenue
+
+* For general data preparation, please see conceptual steps below. See `.rmd` file for detailed code.  
+  
+## Numeric Data Quality Report
+
+### Numeric Data Quality Report
+* `pageviews` has some null values, but there are an insignificant amount, so we will just drop those rows.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Get the factor and numeric reports
+initialReport <- dataQualityReport(df.test.base)
+
+# Numeric data frame stats
+initialReport$dfStats.num %>% kable()
+
+# Numeric column stats
+initialReport$dfColStats.num %>%
+  kable() %>% kable_styling(font_size=7, latex_options = 'HOLD_position') # numeric data
+```
+
+
+
+\newpage
+
+### Factor Data Quality Report
+* Location data unknown, so add an `Unknown` label for `null` values
+* Appears that few people use website from the ads, which cause many null values. See more details below.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# factor data frame stats
+initialReport$dfStats.factor %>% kable()
+
+# factor column stats
+initialReport$dfColStats.factor %>%
+  kable() %>% kable_styling(font_size=7, latex_options = 'HOLD_position') # numeric data
+```
+
+
+```{r, echo=FALSE, results='hide'}
+# ==============================================================================
+# NOTE THAT ALL WILL CLEANSING DONE IN THIS CODE CHUNK TO MAKE IT EASIER
+# END GOAL IS TO CREATE A FUNCTION SO WE CAN EASILY APPLY TO TEST DATA
+# TO REMOVE DUPLICATION
+#
+# Goal is to clean up:
+#   - Missingness
+#   - Factors
+# ==============================================================================
+
+# Copy data
+df <- df.test.base # Full dataset
+str(df.train.clean)
+df.numeric <- df.test.base.numeric # Numeric only columns
+df.factor  <- df.test.base.factor  # Numeric only columns
+df.imputed <- df                    # To store numeric imputation output
+
+# Missingingness ---------------------------------------------------------------
+
+### `Numeric`: Impute missing values using predictive mean matching with the `mice` package
+
+# Note `see Imputation()` function to visualize the imputation
+seeImputation <- function(df, df.meanInputed, 
+                          imputationMethod) {
+  
+  # Min/Max ranges so actual and imputed histograms align
+  yMin = quantile(df.meanInputed$y, 0.05)
+  yMax = max(df.meanInputed$y)
+  
+  # Non Altered data -------------------------------------------------
+  
+  meanVal = mean(df$y, na.rm=T) # mean of the non altered data
+  
+  # Create the plot
+  p1 <- df %>%
+    ggplot(aes(x = y)) +
+    
+    # Histogram
+    geom_histogram(color = 'grey65', fill = 'grey95') +
+    
+    # The mean value line
+    geom_vline(xintercept = meanVal, color = 'tomato3') +
+    
+    # Text associated with mean value
+    annotate("text", 
+             label = "Mean Value", 
+             x = meanVal, y = 100, 
+             size = 5, colour = "tomato3" ) +
+    
+    # Labels
+    labs(title = 'Data with Missing Values',
+         y     = 'Frequency', 
+         x     = '' ) +
+    
+    xlim(yMin, yMax) + # min and max range of x axis (for equal comparison)
+    theme_minimal() # Theme
+  
+  
+  # Imputed data -------------------------------------------------
+  meanValImpute = mean(df.meanInputed$y, na.rm=T)
+  
+  # Create the plot
+  p2 <- df.meanInputed %>%
+    ggplot(aes(x = y)) +
+    
+    # Histogram
+    geom_histogram(color = 'grey65', fill = 'grey95') +
+    
+    # The mean value line
+    geom_vline(xintercept = meanVal, color = 'tomato3') +
+    
+    # Text associated with mean value
+    annotate("text", 
+             label = "Mean Value", 
+             x = meanValImpute, y = 100, 
+             size = 5, colour = "tomato3" ) +
+    
+    # Labels
+    labs(title = 'Data without Missing Values',
+             subtitle = 'Using PMM',
+             y = 'Frequency', 
+             x = imputationMethod) +
+    
+    xlim(yMin, yMax) + # min and max range of x axis (for equal comparison)
+    theme_minimal() # Theme
+  
+  # Variation scatter ----------------------------------------------------------
+  
+  p3 <- df.meanInputed %>% ggplot(aes(x=rexp(length(y)), y=y, color=is.na(df$y))) + 
+    
+    # Add points
+    geom_point(alpha = 0.5) +
+    
+    # Colors, limits, labels, and themes
+    scale_color_manual(values = c('grey80', 'tomato3'),
+                       labels = c('Actuals', 'Imputed') ) +
+    ylim(0, quantile(df.meanInputed$y, 0.99)) + # lower 99% of dist
+    labs(title   = 'Variation of Actuals vs. Imputed Data',
+         x       = 'x', 
+         y       = imputationMethod,
+         caption =paste0('\nUsing testing.csv data',
+                         '\nOnly showing lower 99% of distribution for viewing') 
+         ) +
+    theme_minimal() + theme(legend.position = 'bottom',
+                            legend.title    = element_blank())
+  
+  
+  # Combine the plots for the final returned output
+  combinedPlots <- plot_grid(p1, p2, p3, 
+                             ncol = 1, label_size = 12,
+                             rel_heights = c(1, 1.1, 1.75))
+  return(combinedPlots)
+}
+
+# Create function to impute via `PMM`
+imputeWithPMM <- function(colWithMissingData) {
+  
+  # Using the mice package
+  suppressMessages(library(mice))
+  
+  # Discover the missing rows
+  isMissing <- is.na(colWithMissingData) 
+  
+  # Create data frame to pass to PMM imputation function from mic package
+  df <- data.frame(x       = rexp(length(colWithMissingData)), # meaningless x to help show variation 
+                   y       = colWithMissingData, 
+                   missing = isMissing)
+  
+  # imputation by PMM
+  df[isMissing, "y"] <- mice.impute.pmm( df$y, 
+                                        !df$missing, 
+                                         df$x)
+  
+  return(df$y)
+}
+
+
+# Which columns has Na's?
+colNamesWithNulls.num <- colnames(df.numeric[ , colSums(is.na(df.numeric)) != 0])
+colNamesWithNulls.num
+
+numberOfColsWithNulls = length(colNamesWithNulls.num)
+
+# For each of the numeric columns with null values
+for (colWithNullsNum in 1:numberOfColsWithNulls) {
+  
+  # The name of the column with null values
+  nameOfThisColumn <- colNamesWithNulls.num[colWithNullsNum]
+  
+  # Get the actual data of the column with nulls
+  colWithNulls <- df[, nameOfThisColumn]
+  
+  # Impute the missing values with PMM
+  imputedValues.num <- imputeWithPMM(colWithNulls)
+  
+  # Now store the data in the imputed data frame
+  df.imputed[, nameOfThisColumn] <- imputedValues.num
+  
+  # Save a visualization of the imputation
+  pmmVisual <- seeImputation(data.frame(y = colWithNulls),
+                             data.frame(y = imputedValues.num),
+                             nameOfThisColumn )
+  
+  # Uncomment if you want to visual the PMM imputation
+  # fileToSave = paste0('OutputPMM/Imputation_With_PMM_', nameOfThisColumn, '.pdf')
+  # print(paste0('For imputation results of ', nameOfThisColumn, ', see ', fileToSave))
+  # dir.create("OutputPMM/")
+  # ggsave(pmmVisual, filename = fileToSave,
+  #        height = 11, width = 8.5)
+}
+
+#colnames(df.imputed[ , colSums(is.na(df.imputed)) != 0]) # Check to see if it worked for numeric fields
+
+
+### `Factor`: Leverage k-nearest neighbors to impute missing factor data. ------
+
+# Get the factor data with missing columns
+colNamesWithNulls.factor <- colnames(df.factor[ , colSums(is.na(df.factor)) != 0])
+colNamesWithNulls.factor
+
+NUM_NEIGHBORS = 5 # number of neighbors
+
+# Impute missing factor data for columns with missing data
+imputedValues.factor <- kNN( df[, colNamesWithNulls.factor], k=NUM_NEIGHBORS )
+
+# Remove the columns indicating if factor data was imputed
+imputedValues.factor <- imputedValues.factor %>% dplyr::select(-ends_with('imp'))
+
+# Now store the data in the imputed data frame
+df.imputed[, colNamesWithNulls.factor] <- imputedValues.factor
+
+#colnames(df.imputed[ , colSums(is.na(df.imputed)) != 0]) # Check to see if it worked
+
+```  
+
+```{r, echo=FALSE}
+# We are going to factor collapse factor columns with more than 4 columns
+# So there will be 5 of the original, and 1 containing 'other'
+# This is the threshold
+FACTOR_THRESHOLD = 4
+
+df.test.clean <- df.imputed
+
+# Make data set of `factor` variables called `df.train.base.factor`
+df.test.factor <- df.imputed %>%
+
+  # selecting all the numeric data
+  dplyr::select_if(is.factor) %>%
+
+  # converting the data frame to tibble
+  as_tibble()
+
+# Get list of factors and the number of unique values
+factorCols <-
+  as.data.frame(t(df.test.factor %>% summarise_all(n_distinct))) #%>%
+  # kable()
+
+# Get a list of the factors we are going to collapse
+colsWithManyFactors <- rownames(factorCols %>% filter(V1 > FACTOR_THRESHOLD))
+
+# Show a summary of how many factors will be collapsed
+numberOfColsWithManyFactors = length(colsWithManyFactors)
+paste('Before cleaning, there are', numberOfColsWithManyFactors, 'factor columns with more than',
+      FACTOR_THRESHOLD, 'unique values')
+
+# Collapse the affected factors in the original data (the one that already has imputation)
+## for each factor column that we are about to collapse
+# The third column is omits the cutstomer ID and session ID
+FIRST_NON_CUST_SESSION_IDX = 3
+for (collapsedColNum in FIRST_NON_CUST_SESSION_IDX:numberOfColsWithManyFactors) {
+
+  # The name of the column with null values
+  nameOfThisColumn <- colsWithManyFactors[collapsedColNum]
+
+  # Get the actual data of the column with nulls
+  colWithManyFactors <- df.imputed[, nameOfThisColumn]
+
+  # lumps all levels except for the n most frequent
+  df.test.clean[, nameOfThisColumn] <- fct_lump_n(colWithManyFactors,
+                                                   n=FACTOR_THRESHOLD)
+}
+# Check to see if the factor lumping worked
+factorColsCleaned <-
+  t(df.test.clean %>%
+                       select_if(is.factor) %>%
+                       summarise_all(n_distinct))
+paste('After cleaning, there are', sum(factorColsCleaned > FACTOR_THRESHOLD + 1, na.rm = TRUE),
+      "columns with more than", FACTOR_THRESHOLD + 1, "unique values (omitting NA's)")
+
+#counting unique values for each variable
+# sapply(lapply(df.test.clean, unique), length) %>%
+#   kable()
+
+# Create a cleaned dataset for modeling
+# Does not include any identifiers
+df.test.clean.noPatient <- df.test.clean %>%
+  dplyr::select(-c(examide,citoglipton,glimepiride.pioglitazone,patientID))
+```  
+  
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Removing all other unnecessary values
+rm(df.imputed,df, df.factor, df.numeric,colNamesWithNulls.factor,
+     colNamesWithNulls.num, colWithNulls, colWithNullsNum, imputedValues.factor,
+     imputedValues.num, nameOfThisColumn, numberOfColsWithNulls, collapsedColNum,
+   colWithManyFactors, colsWithManyFactors, df.imputed,
+   df.test.base, df.test.base.factor, df.test.base.numeric, df.test.factor,
+   FACTOR_THRESHOLD, factorCols, factorColsCleaned, FIRST_NON_CUST_SESSION_IDX,
+   NUM_NEIGHBORS, numberOfColsWithManyFactors)
+
+#changing the target column to factor 
+#df.test.clean$readmitted <- factor(df.test.clean$readmitted)
+
+```  
+  
+    
+*   From the performance measures, its clearly evident that Gradient boosting performs better than the rest of the models.  
+*   So, predicting the readmission target column based on the this model.  
+
+```{r, echo=FALSE}
+## Predict the customer data using the Gradient Boost model
+predictions <- as.vector(
+                    predict(fit.grboost,                # MARS Model from training data
+                    newdata = df.test.clean.noPatient,
+                    type='prob') # Test data 
+                    )
+
+
+outputData <- data.frame(patientID      = df.test.clean$patientID,
+                         predReadmit = predictions$`1`)
+
+
+# write the file
+write.csv(file      = 'Kaggle Submission Data (Test).csv',
+          x         = outputData,
+          row.names = FALSE)
+```
